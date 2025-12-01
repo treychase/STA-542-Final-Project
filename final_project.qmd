@@ -1,6 +1,7 @@
 ---
 title: "Time Series Analysis of AAPL Stock"
 format: html
+author: "Trey Chase, Tully Cannon"
 editor: visual
 ---
 
