@@ -1,0 +1,700 @@
+---
+title: "Time Series Analysis of AAPL Stock"
+format: html
+editor: visual
+---
+
+## Model Definitions
+
+### Dynamic Linear Model (DLM)
+
+The observation equation:
+$$y_t = F_t'\theta_t + v_t, \quad v_t \sim N(0, V_t)$$
+
+The state equation:
+$$\theta_t = G_t\theta_{t-1} + w_t, \quad w_t \sim N(0, W_t)$$
+
+For a local level model:
+$$y_t = \theta_t + v_t, \quad v_t \sim N(0, V)$$
+$$\theta_t = \theta_{t-1} + w_t, \quad w_t \sim N(0, W)$$
+
+Priors:
+$$\theta_0 \sim N(m_0, C_0)$$
+$$V \sim \text{Inverse-Gamma}(a_V, b_V)$$
+$$W \sim \text{Inverse-Gamma}(a_W, b_W)$$
+
+### Hidden Markov Model with AR(1) States
+
+State transition probabilities:
+$$P(S_t = j | S_{t-1} = i) = \pi_{ij}$$
+
+Observation model for state $k$:
+$$y_t | S_t = k \sim N(\mu_k + \phi_k(y_{t-1} - \mu_k), \sigma_k^2)$$
+
+where $S_t \in \{1, 2\}$ is the hidden state at time $t$.
+
+### ARIMA Model
+
+$$\phi(B)(1-B)^d y_t = \theta(B)\epsilon_t$$
+
+where:
+- $\phi(B) = 1 - \phi_1B - \phi_2B^2 - ... - \phi_pB^p$ (AR polynomial)
+- $\theta(B) = 1 + \theta_1B + \theta_2B^2 + ... + \theta_qB^q$ (MA polynomial)
+- $d$ is the degree of differencing
+- $\epsilon_t \sim N(0, \sigma^2)$
+
+## Setup
+```{r}
+#| warning: false
+#| message: false
+
+library(quantmod)
+library(tidyverse)
+library(dlm)
+library(depmixS4)
+library(forecast)
+library(tseries)
+library(gridExtra)
+library(knitr)
+library(moments)
+
+set.seed(610)
+```
+
+## Data Loading and Preparation
+```{r}
+# Load AAPL data from Yahoo Finance
+getSymbols("AAPL", src = "yahoo")
+
+# Extract adjusted close prices and dates
+y <- as.numeric(AAPL$AAPL.Adjusted)
+dates <- index(AAPL)
+n <- length(y)
+
+# Remove any NA values
+na_idx <- which(is.na(y))
+if(length(na_idx) > 0) {
+  y <- y[-na_idx]
+  dates <- dates[-na_idx]
+  n <- length(y)
+}
+
+# Log returns
+log_returns <- diff(log(y))
+```
+
+## Exploratory Data Analysis
+```{r}
+#| fig.width: 10
+#| fig.height: 8
+
+par(mfrow = c(2, 2))
+
+# Price time series
+plot(dates, y, type = "l", main = "AAPL Adjusted Close Price",
+     xlab = "Date", ylab = "Price ($)", col = "steelblue", lwd = 1.5)
+
+# Log returns
+plot(dates[-1], log_returns, type = "l", main = "AAPL Log Returns",
+     xlab = "Date", ylab = "Log Returns", col = "darkred", lwd = 1)
+abline(h = 0, lty = 2, col = "gray50")
+
+# ACF of prices
+acf(y, main = "ACF - Prices", lag.max = 50)
+
+# PACF of prices
+pacf(y, main = "PACF - Prices", lag.max = 50)
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+
+par(mfrow = c(2, 2))
+
+# ACF of log returns
+acf(log_returns, main = "ACF - Log Returns", lag.max = 50)
+
+# PACF of log returns
+pacf(log_returns, main = "PACF - Log Returns", lag.max = 50)
+
+# Histogram of returns
+hist(log_returns, breaks = 50, main = "Distribution of Log Returns",
+     xlab = "Log Returns", col = "lightblue", border = "white")
+
+# Q-Q plot
+qqnorm(log_returns, main = "Q-Q Plot - Log Returns")
+qqline(log_returns, col = "red", lwd = 2)
+```
+```{r}
+# Summary statistics
+summary_stats <- data.frame(
+  Metric = c("Mean", "Std Dev", "Min", "Max", "Skewness", "Kurtosis"),
+  Price = c(mean(y), sd(y), min(y), max(y), 
+            skewness(y), kurtosis(y)),
+  Returns = c(mean(log_returns), sd(log_returns), 
+              min(log_returns), max(log_returns),
+              skewness(log_returns), 
+              kurtosis(log_returns))
+)
+
+kable(summary_stats, digits = 4, caption = "Summary Statistics")
+```
+
+## Model 1: Bayesian DLM with Gibbs Sampling
+```{r}
+# Gibbs sampler for local level DLM
+gibbs_dlm <- function(y, n_iter = 5000, burn_in = 1000) {
+  n <- length(y)
+  
+  # Priors
+  m0 <- y[1]
+  C0 <- 1000
+  a_V <- 3
+  b_V <- 2 * var(diff(y))
+  a_W <- 3
+  b_W <- 0.5 * var(diff(y))
+  
+  # Initialize
+  V <- var(diff(y))
+  W <- 0.1 * var(diff(y))
+  theta <- rep(mean(y), n)
+  
+  # Storage
+  samples_V <- numeric(n_iter)
+  samples_W <- numeric(n_iter)
+  samples_theta <- matrix(0, n_iter, n)
+  
+  for(iter in 1:n_iter) {
+    # Forward filter backward sample for theta
+    # Kalman filter
+    m <- numeric(n)
+    C <- numeric(n)
+    a <- numeric(n + 1)
+    R <- numeric(n + 1)
+    
+    a[1] <- m0
+    R[1] <- C0
+    
+    for(t in 1:n) {
+      # Prediction
+      if(t == 1) {
+        a[t] <- m0
+        R[t] <- C0 + W
+      } else {
+        a[t] <- m[t-1]
+        R[t] <- C[t-1] + W
+      }
+      
+      # Update
+      Q <- R[t] + V
+      A <- R[t] / Q
+      m[t] <- a[t] + A * (y[t] - a[t])
+      C[t] <- R[t] - A * Q * A
+    }
+    
+    # Backward sampling
+    theta_new <- numeric(n)
+    theta_new[n] <- rnorm(1, m[n], sqrt(C[n]))
+    
+    for(t in (n-1):1) {
+      h <- C[t] / (C[t] + W)
+      theta_new[t] <- rnorm(1, h * theta_new[t+1] + (1-h) * m[t], 
+                            sqrt(h * C[t]))
+    }
+    
+    theta <- theta_new
+    
+    # Sample V
+    ss_V <- sum((y - theta)^2)
+    V <- 1 / rgamma(1, a_V + n/2, b_V + ss_V/2)
+    
+    # Sample W
+    ss_W <- sum(diff(theta)^2)
+    W <- 1 / rgamma(1, a_W + (n-1)/2, b_W + ss_W/2)
+    
+    # Store
+    samples_V[iter] <- V
+    samples_W[iter] <- W
+    samples_theta[iter, ] <- theta
+  }
+  
+  list(
+    V = samples_V[-(1:burn_in)],
+    W = samples_W[-(1:burn_in)],
+    theta = samples_theta[-(1:burn_in), ],
+    burn_in = burn_in
+  )
+}
+
+# Run Gibbs sampler
+dlm_results <- gibbs_dlm(y, n_iter = 5000, burn_in = 1000)
+
+# Posterior summaries
+theta_mean <- colMeans(dlm_results$theta)
+theta_lower <- apply(dlm_results$theta, 2, quantile, 0.025)
+theta_upper <- apply(dlm_results$theta, 2, quantile, 0.975)
+
+V_mean <- mean(dlm_results$V)
+W_mean <- mean(dlm_results$W)
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+
+par(mfrow = c(2, 2))
+
+# Trace plot V
+plot(dlm_results$V, type = "l", main = "Trace Plot - Observation Variance V",
+     xlab = "Iteration", ylab = "V", col = "steelblue")
+
+# Trace plot W
+plot(dlm_results$W, type = "l", main = "Trace Plot - State Variance W",
+     xlab = "Iteration", ylab = "W", col = "darkred")
+
+# Histogram V
+hist(dlm_results$V, breaks = 50, main = "Posterior Distribution - V",
+     xlab = "V", col = "lightblue", border = "white")
+abline(v = V_mean, col = "red", lwd = 2, lty = 2)
+
+# Histogram W
+hist(dlm_results$W, breaks = 50, main = "Posterior Distribution - W",
+     xlab = "W", col = "lightcoral", border = "white")
+abline(v = W_mean, col = "red", lwd = 2, lty = 2)
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+
+# Fitted values
+plot(dates, y, type = "l", col = "gray70", lwd = 1,
+     main = "DLM: Observed vs Fitted (with 95% Credible Interval)",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates, theta_mean, col = "steelblue", lwd = 2)
+polygon(c(dates, rev(dates)), c(theta_lower, rev(theta_upper)),
+        col = rgb(0, 0, 1, 0.2), border = NA)
+legend("topleft", legend = c("Observed", "Fitted", "95% CI"),
+       col = c("gray70", "steelblue", rgb(0, 0, 1, 0.2)),
+       lwd = c(1, 2, 10), bty = "n")
+```
+```{r}
+# DLM diagnostics
+dlm_residuals <- y - theta_mean
+dlm_mse <- mean(dlm_residuals^2)
+dlm_mae <- mean(abs(dlm_residuals))
+dlm_mape <- mean(abs(dlm_residuals / y)) * 100
+```
+
+## Model 2: HMM with AR(1) States
+```{r}
+# Prepare data for HMM (need lagged values for AR)
+y_hmm <- y[-1]
+y_lag <- y[-length(y)]
+
+hmm_data <- data.frame(y = y_hmm, y_lag = y_lag)
+
+# Fit HMM with AR(1) in each state with optimization settings
+hmm_model <- depmix(y ~ y_lag, 
+                    data = hmm_data,
+                    nstates = 2,
+                    family = gaussian())
+
+# Fit with limited iterations for speed
+hmm_fit <- fit(hmm_model, 
+               verbose = FALSE,
+               emcontrol = em.control(maxit = 100, tol = 1e-4))
+
+# Get states
+hmm_states <- posterior(hmm_fit)
+
+# Extract parameters to calculate fitted values manually
+params <- getpars(hmm_fit)
+
+# Calculate fitted values based on state-specific AR(1) models
+# Get response parameters for each state
+resp_params <- list()
+for(i in 1:2) {
+  resp_params[[i]] <- getpars(hmm_fit@response[[i]][[1]])
+}
+
+# Calculate fitted values using Viterbi path and state-specific parameters
+hmm_fitted <- numeric(length(y_hmm))
+for(i in 1:length(y_hmm)) {
+  state <- hmm_states$state[i]
+  # AR(1) model: y_t = intercept + phi * y_{t-1}
+  intercept <- resp_params[[state]][1]
+  phi <- resp_params[[state]][2]
+  hmm_fitted[i] <- intercept + phi * y_lag[i]
+}
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 8
+
+par(mfrow = c(2, 1))
+
+# Observed vs Fitted
+plot(dates[-1], y_hmm, type = "l", col = "gray70", lwd = 1,
+     main = "HMM: Observed vs Fitted",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates[-1], hmm_fitted, col = "darkgreen", lwd = 2)
+legend("topleft", legend = c("Observed", "Fitted"),
+       col = c("gray70", "darkgreen"), lwd = c(1, 2), bty = "n")
+
+# State probabilities
+plot(dates[-1], hmm_states$state, type = "l",
+     main = "Most Likely State Sequence",
+     xlab = "Date", ylab = "State", col = "purple", lwd = 1.5)
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+
+# Visualization with states
+colors <- ifelse(hmm_states$state == 1, "coral", "lightblue")
+plot(dates[-1], y_hmm, type = "n",
+     main = "AAPL Price Colored by HMM State",
+     xlab = "Date", ylab = "Price ($)")
+for(i in 1:(length(y_hmm)-1)) {
+  lines(dates[(i):(i+1)], y_hmm[i:(i+1)], col = colors[i], lwd = 2)
+}
+legend("topleft", legend = c("State 1", "State 2"),
+       col = c("coral", "lightblue"), lwd = 2, bty = "n")
+```
+```{r}
+# HMM diagnostics
+hmm_residuals <- y_hmm - hmm_fitted
+hmm_mse <- mean(hmm_residuals^2)
+hmm_mae <- mean(abs(hmm_residuals))
+hmm_mape <- mean(abs(hmm_residuals / y_hmm)) * 100
+```
+
+## Model 3: ARIMA
+```{r}
+# Fit ARIMA using auto.arima
+arima_fit <- auto.arima(y, seasonal = FALSE, stepwise = FALSE, 
+                        approximation = FALSE, trace = FALSE)
+
+# Summary
+summary(arima_fit)
+
+# Get fitted values
+arima_fitted <- fitted(arima_fit)
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 8
+
+par(mfrow = c(2, 2))
+
+# Observed vs Fitted
+plot(dates, y, type = "l", col = "gray70", lwd = 1,
+     main = "ARIMA: Observed vs Fitted",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates, arima_fitted, col = "darkorange", lwd = 2)
+legend("topleft", legend = c("Observed", "Fitted"),
+       col = c("gray70", "darkorange"), lwd = c(1, 2), bty = "n")
+
+# Residuals
+plot(dates, residuals(arima_fit), type = "l",
+     main = "ARIMA Residuals",
+     xlab = "Date", ylab = "Residuals", col = "darkred")
+abline(h = 0, lty = 2, col = "gray50")
+
+# ACF of residuals
+acf(residuals(arima_fit), main = "ACF of ARIMA Residuals", lag.max = 50)
+
+# Q-Q plot of residuals
+qqnorm(residuals(arima_fit), main = "Q-Q Plot - ARIMA Residuals")
+qqline(residuals(arima_fit), col = "red", lwd = 2)
+```
+```{r}
+# ARIMA diagnostics
+arima_residuals <- residuals(arima_fit)
+arima_mse <- mean(arima_residuals^2)
+arima_mae <- mean(abs(arima_residuals))
+arima_mape <- mean(abs(arima_residuals / y)) * 100
+
+# Ljung-Box test
+lb_test <- Box.test(arima_residuals, lag = 20, type = "Ljung-Box")
+```
+
+## Model Comparison
+```{r}
+# Information criteria for ARIMA
+arima_aic <- AIC(arima_fit)
+arima_bic <- BIC(arima_fit)
+
+# Log-likelihood for HMM
+hmm_loglik <- logLik(hmm_fit)
+hmm_aic <- AIC(hmm_fit)
+hmm_bic <- BIC(hmm_fit)
+
+# For DLM, calculate using posterior means
+dlm_loglik <- sum(dnorm(y, theta_mean, sqrt(V_mean), log = TRUE))
+n_params_dlm <- 2  # V and W
+dlm_aic <- -2 * dlm_loglik + 2 * n_params_dlm
+dlm_bic <- -2 * dlm_loglik + n_params_dlm * log(n)
+
+# Comparison table
+comparison <- data.frame(
+  Model = c("DLM", "HMM", "ARIMA"),
+  MSE = c(dlm_mse, hmm_mse, arima_mse),
+  MAE = c(dlm_mae, hmm_mae, arima_mae),
+  MAPE = c(dlm_mape, hmm_mape, arima_mape),
+  AIC = c(dlm_aic, hmm_aic, arima_aic),
+  BIC = c(dlm_bic, hmm_bic, arima_bic),
+  LogLik = c(dlm_loglik, as.numeric(hmm_loglik), logLik(arima_fit))
+)
+
+kable(comparison, digits = 2, caption = "Model Comparison")
+```
+```{r}
+#| fig.width: 12
+#| fig.height: 6
+
+# Visual comparison
+par(mfrow = c(1, 1))
+plot(dates, y, type = "l", col = "black", lwd = 1.5,
+     main = "Model Comparison: All Fitted Values",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates, theta_mean, col = "steelblue", lwd = 1.5, lty = 1)
+lines(dates[-1], hmm_fitted, col = "darkgreen", lwd = 1.5, lty = 2)
+lines(dates, arima_fitted, col = "darkorange", lwd = 1.5, lty = 3)
+legend("topleft", 
+       legend = c("Observed", "DLM", "HMM", "ARIMA"),
+       col = c("black", "steelblue", "darkgreen", "darkorange"),
+       lwd = c(1.5, 1.5, 1.5, 1.5),
+       lty = c(1, 1, 2, 3),
+       bty = "n")
+```
+```{r}
+#| fig.width: 10
+#| fig.height: 8
+
+# Residuals comparison
+par(mfrow = c(3, 2))
+
+# DLM residuals
+plot(dates, dlm_residuals, type = "l", col = "steelblue",
+     main = "DLM Residuals", xlab = "Date", ylab = "Residuals")
+abline(h = 0, lty = 2, col = "gray50")
+
+acf(dlm_residuals, main = "ACF - DLM Residuals", lag.max = 50)
+
+# HMM residuals
+plot(dates[-1], hmm_residuals, type = "l", col = "darkgreen",
+     main = "HMM Residuals", xlab = "Date", ylab = "Residuals")
+abline(h = 0, lty = 2, col = "gray50")
+
+acf(hmm_residuals, main = "ACF - HMM Residuals", lag.max = 50)
+
+# ARIMA residuals
+plot(dates, arima_residuals, type = "l", col = "darkorange",
+     main = "ARIMA Residuals", xlab = "Date", ylab = "Residuals")
+abline(h = 0, lty = 2, col = "gray50")
+
+acf(arima_residuals, main = "ACF - ARIMA Residuals", lag.max = 50)
+```
+
+## 10-Year Forecasts
+```{r}
+# 10 years of trading days (approximately 252 trading days per year)
+n_ahead <- 252 * 10
+
+# DLM forecast (using posterior means)
+dlm_fc <- numeric(n_ahead)
+dlm_fc_var <- numeric(n_ahead)
+last_theta <- theta_mean[n]
+
+for(h in 1:n_ahead) {
+  dlm_fc[h] <- last_theta
+  dlm_fc_var[h] <- V_mean + h * W_mean
+}
+
+dlm_fc_lower <- dlm_fc - 1.96 * sqrt(dlm_fc_var)
+dlm_fc_upper <- dlm_fc + 1.96 * sqrt(dlm_fc_var)
+
+# ARIMA forecast
+arima_fc <- forecast(arima_fit, h = n_ahead)
+
+# HMM forecast (using last state parameters)
+last_state <- hmm_states$state[length(hmm_states$state)]
+intercept_last <- resp_params[[last_state]][1]
+phi_last <- resp_params[[last_state]][2]
+sigma_last <- resp_params[[last_state]][3]  # residual standard deviation
+
+hmm_fc <- numeric(n_ahead)
+hmm_fc_var <- numeric(n_ahead)
+hmm_fc[1] <- intercept_last + phi_last * y[n]
+
+# For AR(1): variance grows to sigma^2 / (1 - phi^2) as h -> infinity
+for(h in 1:n_ahead) {
+  if(h > 1) {
+    hmm_fc[h] <- intercept_last + phi_last * hmm_fc[h-1]
+  }
+  # Variance of h-step ahead forecast for AR(1)
+  if(abs(phi_last) < 1) {
+    hmm_fc_var[h] <- sigma_last^2 * (1 - phi_last^(2*h)) / (1 - phi_last^2)
+  } else {
+    hmm_fc_var[h] <- sigma_last^2 * h  # if phi >= 1, use simple approximation
+  }
+}
+
+hmm_fc_lower <- hmm_fc - 1.96 * sqrt(hmm_fc_var)
+hmm_fc_upper <- hmm_fc + 1.96 * sqrt(hmm_fc_var)
+```
+```{r}
+#| fig.width: 14
+#| fig.height: 8
+
+# Plot forecasts with all three models showing shaded CI regions
+fc_dates <- seq(max(dates) + 1, by = "day", length.out = n_ahead)
+all_dates <- c(dates, fc_dates)
+
+# Determine appropriate y-axis limits
+y_min <- min(y, dlm_fc_lower, arima_fc$lower[,2], hmm_fc_lower, na.rm = TRUE)
+y_max <- max(y, dlm_fc_upper, arima_fc$upper[,2], hmm_fc_upper, na.rm = TRUE)
+
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(y_min, y_max),
+     main = "10-Year Forecasts with 95% Confidence Intervals",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50", lwd = 2)
+
+# DLM forecast with shaded CI
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(dlm_fc_lower, rev(dlm_fc_upper)),
+        col = rgb(0, 0, 1, 0.15), border = NA)
+lines(fc_dates, dlm_fc, col = "steelblue", lwd = 2.5)
+
+# ARIMA forecast with shaded CI
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(arima_fc$lower[,2], rev(arima_fc$upper[,2])),
+        col = rgb(1, 0.5, 0, 0.15), border = NA)
+lines(fc_dates, arima_fc$mean, col = "darkorange", lwd = 2.5)
+
+# HMM forecast with shaded CI
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(hmm_fc_lower, rev(hmm_fc_upper)),
+        col = rgb(0, 0.5, 0, 0.15), border = NA)
+lines(fc_dates, hmm_fc, col = "darkgreen", lwd = 2.5)
+
+legend("topleft", 
+       legend = c("Observed", "DLM", "ARIMA", "HMM", "95% CI"),
+       col = c("black", "steelblue", "darkorange", "darkgreen", "gray70"),
+       lwd = c(1.5, 2.5, 2.5, 2.5, 10),
+       bty = "n")
+```
+```{r}
+#| fig.width: 14
+#| fig.height: 8
+
+# Forecast only (zoomed in on forecast period)
+y_min_fc <- min(dlm_fc_lower, arima_fc$lower[,2], hmm_fc_lower, na.rm = TRUE)
+y_max_fc <- max(dlm_fc_upper, arima_fc$upper[,2], hmm_fc_upper, na.rm = TRUE)
+
+plot(fc_dates, dlm_fc, type = "n",
+     ylim = c(y_min_fc, y_max_fc),
+     main = "10-Year Forecast Comparison with 95% Confidence Intervals",
+     xlab = "Date", ylab = "Price ($)")
+
+# DLM
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(dlm_fc_lower, rev(dlm_fc_upper)),
+        col = rgb(0, 0, 1, 0.2), border = NA)
+lines(fc_dates, dlm_fc, col = "steelblue", lwd = 2.5)
+
+# ARIMA
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(arima_fc$lower[,2], rev(arima_fc$upper[,2])),
+        col = rgb(1, 0.5, 0, 0.2), border = NA)
+lines(fc_dates, arima_fc$mean, col = "darkorange", lwd = 2.5)
+
+# HMM
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(hmm_fc_lower, rev(hmm_fc_upper)),
+        col = rgb(0, 0.5, 0, 0.2), border = NA)
+lines(fc_dates, hmm_fc, col = "darkgreen", lwd = 2.5)
+
+# Add horizontal line at last observed value
+abline(h = y[n], lty = 3, col = "gray30", lwd = 1.5)
+
+legend("topleft", 
+       legend = c("DLM", "ARIMA", "HMM", "Last Observed", "95% CI"),
+       col = c("steelblue", "darkorange", "darkgreen", "gray30", "gray70"),
+       lwd = c(2.5, 2.5, 2.5, 1.5, 10),
+       lty = c(1, 1, 1, 3, 1),
+       bty = "n")
+```
+```{r}
+#| fig.width: 14
+#| fig.height: 10
+
+# Individual model forecast plots
+par(mfrow = c(3, 1))
+
+# DLM only
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(min(y, dlm_fc_lower), max(y, dlm_fc_upper)),
+     main = "DLM: 10-Year Forecast with 95% Credible Interval",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50")
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(dlm_fc_lower, rev(dlm_fc_upper)),
+        col = rgb(0, 0, 1, 0.3), border = NA)
+lines(fc_dates, dlm_fc, col = "steelblue", lwd = 2.5)
+legend("topleft", legend = c("Observed", "Forecast", "95% Credible Interval"),
+       col = c("black", "steelblue", rgb(0, 0, 1, 0.3)),
+       lwd = c(1.5, 2.5, 10), bty = "n")
+
+# ARIMA only
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(min(y, arima_fc$lower[,2]), max(y, arima_fc$upper[,2])),
+     main = "ARIMA: 10-Year Forecast with 95% Confidence Interval",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50")
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(arima_fc$lower[,2], rev(arima_fc$upper[,2])),
+        col = rgb(1, 0.5, 0, 0.3), border = NA)
+lines(fc_dates, arima_fc$mean, col = "darkorange", lwd = 2.5)
+legend("topleft", legend = c("Observed", "Forecast", "95% Confidence Interval"),
+       col = c("black", "darkorange", rgb(1, 0.5, 0, 0.3)),
+       lwd = c(1.5, 2.5, 10), bty = "n")
+
+# HMM only
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(min(y, hmm_fc_lower), max(y, hmm_fc_upper)),
+     main = "HMM: 10-Year Forecast with 95% Confidence Interval",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50")
+polygon(c(fc_dates, rev(fc_dates)), 
+        c(hmm_fc_lower, rev(hmm_fc_upper)),
+        col = rgb(0, 0.5, 0, 0.3), border = NA)
+lines(fc_dates, hmm_fc, col = "darkgreen", lwd = 2.5)
+legend("topleft", legend = c("Observed", "Forecast", "95% Confidence Interval"),
+       col = c("black", "darkgreen", rgb(0, 0.5, 0, 0.3)),
+       lwd = c(1.5, 2.5, 10), bty = "n")
+```
+```{r}
+# Summary of forecast values
+forecast_summary <- data.frame(
+  Model = c("DLM", "ARIMA", "HMM"),
+  `1-Year` = c(dlm_fc[252], arima_fc$mean[252], hmm_fc[252]),
+  `5-Year` = c(dlm_fc[252*5], arima_fc$mean[252*5], hmm_fc[252*5]),
+  `10-Year` = c(dlm_fc[252*10], arima_fc$mean[252*10], hmm_fc[252*10]),
+  `1Y_Lower` = c(dlm_fc_lower[252], arima_fc$lower[252, 2], hmm_fc_lower[252]),
+  `1Y_Upper` = c(dlm_fc_upper[252], arima_fc$upper[252, 2], hmm_fc_upper[252]),
+  `10Y_Lower` = c(dlm_fc_lower[n_ahead], arima_fc$lower[n_ahead, 2], hmm_fc_lower[n_ahead]),
+  `10Y_Upper` = c(dlm_fc_upper[n_ahead], arima_fc$upper[n_ahead, 2], hmm_fc_upper[n_ahead])
+)
+
+kable(forecast_summary, digits = 2, 
+      caption = "Forecast Summary at Key Time Points",
+      col.names = c("Model", "1-Year", "5-Year", "10-Year", 
+                    "1Y Lower", "1Y Upper", "10Y Lower", "10Y Upper"))
+```
+
+## Session Info
+```{r}
+sessionInfo()
+```
