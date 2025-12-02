@@ -1,0 +1,776 @@
+---
+title: "Time Series Analysis of AAPL Stock"
+author: "Trey Chase, Tully Cannon"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+# Model Definitions
+
+## Dynamic Linear Model (DLM)
+
+The observation equation:
+$$y_t = F'_t \theta_t + v_t, \quad v_t \sim N(0, V_t)$$
+
+The state equation:
+$$\theta_t = G_t\theta_{t-1} + w_t, \quad w_t \sim N(0, W_t)$$
+
+For a local level model:
+$$y_t = \theta_t + v_t, \quad v_t \sim N(0, V)$$
+$$\theta_t = \theta_{t-1} + w_t, \quad w_t \sim N(0, W)$$
+
+Priors:
+$$\theta_0 \sim N(m_0, C_0)$$
+$$V \sim \text{Inverse-Gamma}(a_V, b_V)$$
+$$W \sim \text{Inverse-Gamma}(a_W, b_W)$$
+
+## Hidden Markov Model with AR(1) States
+
+State transition probabilities:
+$$P(S_t = j|S_{t-1} = i) = \pi_{ij}$$
+
+Observation model for state $k$:
+$$y_t|S_t = k \sim N(\mu_k + \phi_k(y_{t-1} - \mu_k), \sigma^2_k)$$
+
+where $S_t \in \{1, 2\}$ is the hidden state at time $t$.
+
+## ARIMA Model
+
+$$\phi(B)(1 - B)^d y_t = \theta(B)\epsilon_t$$
+
+where:
+- $\phi(B) = 1 - \phi_1 B - \phi_2 B^2 - \ldots - \phi_p B^p$ (AR polynomial)
+- $\theta(B) = 1 + \theta_1 B + \theta_2 B^2 + \ldots + \theta_q B^q$ (MA polynomial)
+- $d$ is the degree of differencing
+- $\epsilon_t \sim N(0, \sigma^2)$
+
+# Setup
+
+```{r setup}
+library(quantmod)
+library(tidyverse)
+library(dlm)
+library(depmixS4)
+library(forecast)
+library(tseries)
+library(gridExtra)
+library(knitr)
+library(moments)
+
+set.seed(610)
+```
+
+# Data Loading and Preparation
+
+```{r data-prep}
+# Load AAPL data from Yahoo Finance
+getSymbols("AAPL", src = "yahoo")
+
+# Extract adjusted close prices and dates
+y <- as.numeric(AAPL$AAPL.Adjusted)
+dates <- index(AAPL)
+n <- length(y)
+
+# Remove any NA values
+na_idx <- which(is.na(y))
+if(length(na_idx) > 0) {
+  y <- y[-na_idx]
+  dates <- dates[-na_idx]
+  n <- length(y)
+}
+
+# Log returns
+log_returns <- diff(log(y))
+```
+
+# Exploratory Data Analysis
+
+```{r eda-plots, fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+
+# Price time series
+plot(dates, y, type = "l", main = "AAPL Adjusted Close Price",
+     xlab = "Date", ylab = "Price ($)", col = "steelblue", lwd = 1.5)
+
+# Log returns
+plot(dates[-1], log_returns, type = "l", main = "AAPL Log Returns",
+     xlab = "Date", ylab = "Log Returns", col = "darkred", lwd = 1)
+abline(h = 0, lty = 2, col = "gray50")
+
+# ACF of prices
+acf(y, main = "ACF - Prices", lag.max = 50)
+
+# PACF of prices
+pacf(y, main = "PACF - Prices", lag.max = 50)
+```
+
+## Interpretation: Price Series and Autocorrelation
+
+The AAPL adjusted close price shows a strong upward trend over time, with notable growth particularly after 2019. The price series exhibits clear non-stationarity, as evidenced by the persistent autocorrelation structure in the ACF plot where all lags remain highly significant. The PACF shows a sharp cutoff after lag 1, suggesting the price series follows a random walk or near-random walk process. This behavior is typical of stock prices and indicates that differencing will be necessary for ARIMA modeling.
+
+```{r returns-acf, fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+
+# ACF of log returns
+acf(log_returns, main = "ACF - Log Returns", lag.max = 50)
+
+# PACF of log returns
+pacf(log_returns, main = "PACF - Log Returns", lag.max = 50)
+
+# Histogram of returns
+hist(log_returns, breaks = 50, main = "Distribution of Log Returns",
+     xlab = "Log Returns", col = "lightblue", border = "white")
+
+# Q-Q plot
+qqnorm(log_returns, main = "Q-Q Plot - Log Returns")
+qqline(log_returns, col = "red", lwd = 2)
+```
+
+## Interpretation: Return Distribution
+
+The log returns show much weaker autocorrelation compared to prices, suggesting the differenced series is approximately stationary. However, the distribution of returns exhibits fat tails and slight negative skewness (as confirmed in the summary statistics), indicating higher probability of extreme events than would be expected under normality. The Q-Q plot reveals significant departures from normality in both tails, with the kurtosis of 9.92 indicating substantial excess kurtosis. This suggests that models assuming normality may underestimate the risk of extreme price movements.
+
+```{r summary-stats}
+# Summary statistics
+summary_stats <- data.frame(
+  Metric = c("Mean", "Std Dev", "Min", "Max", "Skewness", "Kurtosis"),
+  Price = c(mean(y), sd(y), min(y), max(y),
+            skewness(y), kurtosis(y)),
+  Returns = c(mean(log_returns), sd(log_returns),
+              min(log_returns), max(log_returns),
+              skewness(log_returns),
+              kurtosis(log_returns))
+)
+
+kable(summary_stats, digits = 4, caption = "Summary Statistics")
+```
+
+## Summary Statistics Interpretation
+
+The price series shows a mean of $64.98 with high volatility (SD = $72.69), reflecting AAPL's substantial growth over the analysis period. The log returns have a positive mean of 0.001 (approximately 0.1% per day), indicating positive drift. The standard deviation of returns (1.98%) represents typical daily volatility. The negative skewness (-0.31) and high kurtosis (9.92) in returns indicate asymmetric risk with fat tails—investors face higher probability of large negative moves than a normal distribution would suggest.
+
+# Model 1: Bayesian DLM with Gibbs Sampling
+
+```{r dlm-gibbs}
+# Gibbs sampler for local level DLM
+gibbs_dlm <- function(y, n_iter = 5000, burn_in = 1000) {
+  n <- length(y)
+  
+  # Priors
+  m0 <- y[1]
+  C0 <- 1000
+  a_V <- 3
+  b_V <- 2 * var(diff(y))
+  a_W <- 3
+  b_W <- 0.5 * var(diff(y))
+  
+  # Initialize
+  V <- var(diff(y))
+  W <- 0.1 * var(diff(y))
+  theta <- rep(mean(y), n)
+  
+  # Storage
+  samples_V <- numeric(n_iter)
+  samples_W <- numeric(n_iter)
+  samples_theta <- matrix(0, n_iter, n)
+  
+  for(iter in 1:n_iter) {
+    # Forward filter backward sample for theta
+    # Kalman filter
+    m <- numeric(n)
+    C <- numeric(n)
+    a <- numeric(n + 1)
+    R <- numeric(n + 1)
+    
+    a[1] <- m0
+    R[1] <- C0
+    
+    for(t in 1:n) {
+      # Prediction
+      if(t == 1) {
+        a[t] <- m0
+        R[t] <- C0 + W
+      } else {
+        a[t] <- m[t-1]
+        R[t] <- C[t-1] + W
+      }
+      
+      # Update
+      Q <- R[t] + V
+      A <- R[t] / Q
+      m[t] <- a[t] + A * (y[t] - a[t])
+      C[t] <- R[t] - A * Q * A
+    }
+    
+    # Backward sampling
+    theta_new <- numeric(n)
+    theta_new[n] <- rnorm(1, m[n], sqrt(C[n]))
+    
+    for(t in (n-1):1) {
+      h <- C[t] / (C[t] + W)
+      theta_new[t] <- rnorm(1, h * theta_new[t+1] + (1-h) * m[t],
+                            sqrt(h * C[t]))
+    }
+    
+    theta <- theta_new
+    
+    # Sample V
+    ss_V <- sum((y - theta)^2)
+    V <- 1 / rgamma(1, a_V + n/2, b_V + ss_V/2)
+    
+    # Sample W
+    ss_W <- sum(diff(theta)^2)
+    W <- 1 / rgamma(1, a_W + (n-1)/2, b_W + ss_W/2)
+    
+    # Store
+    samples_V[iter] <- V
+    samples_W[iter] <- W
+    samples_theta[iter, ] <- theta
+  }
+  
+  list(
+    V = samples_V[-(1:burn_in)],
+    W = samples_W[-(1:burn_in)],
+    theta = samples_theta[-(1:burn_in), ],
+    burn_in = burn_in
+  )
+}
+
+# Run Gibbs sampler
+dlm_results <- gibbs_dlm(y, n_iter = 5000, burn_in = 1000)
+
+# Posterior summaries
+theta_mean <- colMeans(dlm_results$theta)
+theta_lower <- apply(dlm_results$theta, 2, quantile, 0.025)
+theta_upper <- apply(dlm_results$theta, 2, quantile, 0.975)
+
+V_mean <- mean(dlm_results$V)
+W_mean <- mean(dlm_results$W)
+```
+
+```{r dlm-diagnostics, fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+
+# Trace plot V
+plot(dlm_results$V, type = "l", main = "Trace Plot - Observation Variance V",
+     xlab = "Iteration", ylab = "V", col = "steelblue")
+
+# Trace plot W
+plot(dlm_results$W, type = "l", main = "Trace Plot - State Variance W",
+     xlab = "Iteration", ylab = "W", col = "darkred")
+
+# Histogram V
+hist(dlm_results$V, breaks = 50, main = "Posterior Distribution - V",
+     xlab = "V", col = "lightblue", border = "white")
+abline(v = V_mean, col = "red", lwd = 2, lty = 2)
+
+# Histogram W
+hist(dlm_results$W, breaks = 50, main = "Posterior Distribution - W",
+     xlab = "W", col = "lightcoral", border = "white")
+abline(v = W_mean, col = "red", lwd = 2, lty = 2)
+```
+
+## DLM Convergence Interpretation
+
+The trace plots for both variance parameters (V and W) show good mixing and stationarity after the burn-in period, indicating successful convergence of the Gibbs sampler. The observation variance (V) has a posterior mean of approximately 0.0024, while the state variance (W) has a posterior mean of approximately 2.9. The relatively large W compared to V indicates substantial evolution in the underlying state (price level) over time, which is consistent with the strong trend observed in AAPL prices. The well-behaved posterior distributions suggest reliable parameter estimation.
+
+```{r dlm-fit, fig.width=10, fig.height=6}
+# Fitted values
+plot(dates, y, type = "l", col = "gray70", lwd = 1,
+     main = "DLM: Observed vs Fitted (with 95% Credible Interval)",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates, theta_mean, col = "steelblue", lwd = 2)
+polygon(c(dates, rev(dates)), c(theta_lower, rev(theta_upper)),
+        col = rgb(0, 0, 1, 0.2), border = NA)
+legend("topleft", legend = c("Observed", "Fitted", "95% CI"),
+       col = c("gray70", "steelblue", rgb(0, 0, 1, 0.2)),
+       lwd = c(1, 2, 10), bty = "n")
+```
+
+## DLM Fit Quality
+
+The DLM provides an excellent fit to the observed AAPL prices, with the fitted values closely tracking the actual prices throughout the entire time series. The 95% credible intervals are quite narrow and contain the observed values, indicating both good model fit and precise estimation. The model successfully captures both the long-term trend and short-term fluctuations in the stock price. The nearly zero MSE (0.00) reflects the model's ability to perfectly smooth through the noise while tracking the underlying price level.
+
+```{r dlm-metrics}
+# DLM diagnostics
+dlm_residuals <- y - theta_mean
+dlm_mse <- mean(dlm_residuals^2)
+dlm_mae <- mean(abs(dlm_residuals))
+dlm_mape <- mean(abs(dlm_residuals / y)) * 100
+```
+
+# Model 2: HMM with AR(1) States
+
+```{r hmm-fit}
+# Prepare data for HMM (need lagged values for AR)
+y_hmm <- y[-1]
+y_lag <- y[-length(y)]
+hmm_data <- data.frame(y = y_hmm, y_lag = y_lag)
+
+# Fit HMM with AR(1) in each state
+hmm_model <- depmix(y ~ y_lag,
+                    data = hmm_data,
+                    nstates = 2,
+                    family = gaussian())
+
+# Fit with limited iterations for speed
+hmm_fit <- fit(hmm_model,
+               verbose = FALSE,
+               emcontrol = em.control(maxit = 100, tol = 1e-4))
+
+# Get states
+hmm_states <- posterior(hmm_fit)
+
+# Extract parameters to calculate fitted values
+params <- getpars(hmm_fit)
+
+# Calculate fitted values based on state-specific AR(1) models
+resp_params <- list()
+for(i in 1:2) {
+  resp_params[[i]] <- getpars(hmm_fit@response[[i]][[1]])
+}
+
+# Calculate fitted values using Viterbi path
+hmm_fitted <- numeric(length(y_hmm))
+for(i in 1:length(y_hmm)) {
+  state <- hmm_states$state[i]
+  intercept <- resp_params[[state]][1]
+  phi <- resp_params[[state]][2]
+  hmm_fitted[i] <- intercept + phi * y_lag[i]
+}
+```
+
+```{r hmm-plots, fig.width=10, fig.height=10}
+par(mfrow = c(3, 1))
+
+# Observed vs Fitted
+plot(dates[-1], y_hmm, type = "l", col = "gray70", lwd = 1,
+     main = "HMM: Observed vs Fitted",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates[-1], hmm_fitted, col = "darkgreen", lwd = 2)
+legend("topleft", legend = c("Observed", "Fitted"),
+       col = c("gray70", "darkgreen"), lwd = c(1, 2), bty = "n")
+
+# State probabilities
+plot(dates[-1], hmm_states$state, type = "l",
+     main = "Most Likely State Sequence",
+     xlab = "Date", ylab = "State", col = "purple", lwd = 1.5)
+
+# Visualization with states
+colors <- ifelse(hmm_states$state == 1, "coral", "lightblue")
+plot(dates[-1], y_hmm, type = "n",
+     main = "AAPL Price Colored by HMM State",
+     xlab = "Date", ylab = "Price ($)")
+for(i in 1:(length(y_hmm)-1)) {
+  lines(dates[(i):(i+1)], y_hmm[i:(i+1)], col = colors[i], lwd = 2)
+}
+legend("topleft", legend = c("State 1", "State 2"),
+       col = c("coral", "lightblue"), lwd = 2, bty = "n")
+```
+
+## HMM State Interpretation
+
+The Hidden Markov Model identified two distinct market regimes throughout AAPL's history. State 1 (coral) appears to be associated with periods of higher volatility or market stress, appearing notably during 2015-2016 and more frequently during 2018-2020. State 2 (lightblue) represents the more stable, trending regime that dominated the early and most recent periods. The model's ability to switch between these states allows it to adapt to changing market conditions, potentially capturing periods of different volatility or growth patterns. The infrequent state transitions suggest relatively persistent market regimes.
+
+```{r hmm-metrics}
+# HMM diagnostics
+hmm_residuals <- y_hmm - hmm_fitted
+hmm_mse <- mean(hmm_residuals^2)
+hmm_mae <- mean(abs(hmm_residuals))
+hmm_mape <- mean(abs(hmm_residuals / y_hmm)) * 100
+```
+
+# Model 3: ARIMA
+
+```{r arima-fit}
+# Fit ARIMA using auto.arima
+arima_fit <- auto.arima(y, seasonal = FALSE, stepwise = FALSE,
+                        approximation = FALSE, trace = FALSE)
+
+# Get fitted values
+arima_fitted <- fitted(arima_fit)
+```
+
+```{r arima-summary}
+summary(arima_fit)
+```
+
+## ARIMA Model Selection
+
+The automatic model selection procedure chose an ARIMA(5,2,0) model, indicating that AAPL prices require second-order differencing to achieve stationarity (confirming the strong trend observed in EDA). The five AR terms all have negative coefficients, representing a complex autoregressive structure. The model's AIC of 19,416.71 and BIC of 19,455.51 will be used for comparison with other models. The relatively low MAPE of 1.50% suggests good in-sample prediction accuracy.
+
+```{r arima-plots, fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+
+# Observed vs Fitted
+plot(dates, y, type = "l", col = "gray70", lwd = 1,
+     main = "ARIMA: Observed vs Fitted",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates, arima_fitted, col = "darkorange", lwd = 2)
+legend("topleft", legend = c("Observed", "Fitted"),
+       col = c("gray70", "darkorange"), lwd = c(1, 2), bty = "n")
+
+# Residuals
+plot(dates, residuals(arima_fit), type = "l",
+     main = "ARIMA Residuals",
+     xlab = "Date", ylab = "Residuals", col = "darkred")
+abline(h = 0, lty = 2, col = "gray50")
+
+# ACF of residuals
+acf(residuals(arima_fit), main = "ACF of ARIMA Residuals", lag.max = 50)
+
+# Q-Q plot of residuals
+qqnorm(residuals(arima_fit), main = "Q-Q Plot - ARIMA Residuals")
+qqline(residuals(arima_fit), col = "red", lwd = 2)
+```
+
+## ARIMA Residual Diagnostics
+
+The ARIMA residuals appear reasonably well-behaved with no strong autocorrelation structure remaining (most ACF lags within confidence bounds), suggesting the model has adequately captured the temporal dependencies. However, the Q-Q plot reveals substantial departures from normality in both tails, consistent with the fat-tailed return distribution observed earlier. The residuals show some heteroskedasticity, with larger residuals appearing in the later portion of the series (post-2020), indicating the model may underestimate uncertainty during volatile periods.
+
+```{r arima-metrics}
+# ARIMA diagnostics
+arima_residuals <- residuals(arima_fit)
+arima_mse <- mean(arima_residuals^2)
+arima_mae <- mean(abs(arima_residuals))
+arima_mape <- mean(abs(arima_residuals / y)) * 100
+
+# Ljung-Box test
+lb_test <- Box.test(arima_residuals, lag = 20, type = "Ljung-Box")
+```
+
+# Model Comparison
+
+```{r model-comparison}
+# Information criteria for ARIMA
+arima_aic <- AIC(arima_fit)
+arima_bic <- BIC(arima_fit)
+
+# Log-likelihood for HMM
+hmm_loglik <- logLik(hmm_fit)
+hmm_aic <- AIC(hmm_fit)
+hmm_bic <- BIC(hmm_fit)
+
+# For DLM, calculate using posterior means
+dlm_loglik <- sum(dnorm(y, theta_mean, sqrt(V_mean), log = TRUE))
+n_params_dlm <- 2  # V and W
+dlm_aic <- -2 * dlm_loglik + 2 * n_params_dlm
+dlm_bic <- -2 * dlm_loglik + n_params_dlm * log(n)
+
+# Comparison table
+comparison <- data.frame(
+  Model = c("DLM", "HMM", "ARIMA"),
+  MSE = c(dlm_mse, hmm_mse, arima_mse),
+  MAE = c(dlm_mae, hmm_mae, arima_mae),
+  MAPE = c(dlm_mape, hmm_mape, arima_mape),
+  AIC = c(dlm_aic, hmm_aic, arima_aic),
+  BIC = c(dlm_bic, hmm_bic, arima_bic),
+  LogLik = c(dlm_loglik, as.numeric(hmm_loglik), logLik(arima_fit))
+)
+
+kable(comparison, digits = 2, caption = "Model Comparison")
+```
+
+## Model Comparison Interpretation
+
+The Dynamic Linear Model (DLM) dramatically outperforms both competitors across all metrics. With MSE and MAE both at 0.00 and MAPE of 0.00%, the DLM achieves near-perfect in-sample fit. Its log-likelihood of 9,911.07 substantially exceeds the other models, and despite having only 2 parameters, it achieves the best AIC (-19,818.14) and BIC (-19,805.20).
+
+The HMM and ARIMA models show similar performance to each other, with MSEs of 2.93 and 3.46 respectively, and MAPEs around 1.4-1.5%. The HMM has better information criteria (AIC = 9,495.59) compared to ARIMA (AIC = 19,416.71), suggesting it provides a better balance of fit and complexity for this data.
+
+The DLM's superior performance reflects its flexibility in adapting to the evolving price level through the state equation, making it ideal for non-stationary financial time series with strong trends. However, this excellent in-sample fit may not necessarily translate to better out-of-sample forecasting performance.
+
+```{r comparison-plot, fig.width=10, fig.height=6}
+# Visual comparison
+plot(dates, y, type = "l", col = "black", lwd = 1.5,
+     main = "Model Comparison: All Fitted Values",
+     xlab = "Date", ylab = "Price ($)")
+lines(dates, theta_mean, col = "steelblue", lwd = 1.5, lty = 1)
+lines(dates[-1], hmm_fitted, col = "darkgreen", lwd = 1.5, lty = 2)
+lines(dates, arima_fitted, col = "darkorange", lwd = 1.5, lty = 3)
+legend("topleft",
+       legend = c("Observed", "DLM", "HMM", "ARIMA"),
+       col = c("black", "steelblue", "darkgreen", "darkorange"),
+       lwd = c(1.5, 1.5, 1.5, 1.5),
+       lty = c(1, 1, 2, 3),
+       bty = "n")
+```
+
+```{r residuals-comparison, fig.width=10, fig.height=10}
+# Residuals comparison
+par(mfrow = c(3, 2))
+
+# DLM residuals
+plot(dates, dlm_residuals, type = "l", col = "steelblue",
+     main = "DLM Residuals", xlab = "Date", ylab = "Residuals")
+abline(h = 0, lty = 2, col = "gray50")
+
+acf(dlm_residuals, main = "ACF - DLM Residuals", lag.max = 50)
+
+# HMM residuals
+plot(dates[-1], hmm_residuals, type = "l", col = "darkgreen",
+     main = "HMM Residuals", xlab = "Date", ylab = "Residuals")
+abline(h = 0, lty = 2, col = "gray50")
+
+acf(hmm_residuals, main = "ACF - HMM Residuals", lag.max = 50)
+
+# ARIMA residuals
+plot(dates, arima_residuals, type = "l", col = "darkorange",
+     main = "ARIMA Residuals", xlab = "Date", ylab = "Residuals")
+abline(h = 0, lty = 2, col = "gray50")
+
+acf(arima_residuals, main = "ACF - ARIMA Residuals", lag.max = 50)
+```
+
+# 10-Year Forecasts
+
+```{r forecast-calculations}
+# 10 years of trading days (approximately 252 trading days per year)
+n_ahead <- 252 * 10
+
+# DLM forecast (using posterior means)
+dlm_fc <- numeric(n_ahead)
+dlm_fc_var <- numeric(n_ahead)
+last_theta <- theta_mean[n]
+
+for(h in 1:n_ahead) {
+  dlm_fc[h] <- last_theta
+  dlm_fc_var[h] <- V_mean + h * W_mean
+}
+
+dlm_fc_lower <- dlm_fc - 1.96 * sqrt(dlm_fc_var)
+dlm_fc_upper <- dlm_fc + 1.96 * sqrt(dlm_fc_var)
+
+# ARIMA forecast
+arima_fc <- forecast(arima_fit, h = n_ahead)
+
+# HMM forecast (using last state parameters)
+last_state <- hmm_states$state[length(hmm_states$state)]
+intercept_last <- resp_params[[last_state]][1]
+phi_last <- resp_params[[last_state]][2]
+sigma_last <- resp_params[[last_state]][3]
+
+hmm_fc <- numeric(n_ahead)
+hmm_fc_var <- numeric(n_ahead)
+hmm_fc[1] <- intercept_last + phi_last * y[n]
+
+for(h in 1:n_ahead) {
+  if(h > 1) {
+    hmm_fc[h] <- intercept_last + phi_last * hmm_fc[h-1]
+  }
+  
+  if(abs(phi_last) < 1) {
+    hmm_fc_var[h] <- sigma_last^2 * (1 - phi_last^(2*h)) / (1 - phi_last^2)
+  } else {
+    hmm_fc_var[h] <- sigma_last^2 * h
+  }
+}
+
+hmm_fc_lower <- hmm_fc - 1.96 * sqrt(hmm_fc_var)
+hmm_fc_upper <- hmm_fc + 1.96 * sqrt(hmm_fc_var)
+
+# Forecast dates
+fc_dates <- seq(max(dates) + 1, by = "day", length.out = n_ahead)
+all_dates <- c(dates, fc_dates)
+```
+
+```{r forecast-combined, fig.width=12, fig.height=7}
+# Combined forecast plot
+y_min <- min(y, dlm_fc_lower, arima_fc$lower[,2], hmm_fc_lower, na.rm = TRUE)
+y_max <- max(y, dlm_fc_upper, arima_fc$upper[,2], hmm_fc_upper, na.rm = TRUE)
+
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(y_min, y_max),
+     main = "10-Year Forecasts with 95% Confidence Intervals",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50", lwd = 2)
+
+# DLM forecast
+polygon(c(fc_dates, rev(fc_dates)),
+        c(dlm_fc_lower, rev(dlm_fc_upper)),
+        col = rgb(0, 0, 1, 0.15), border = NA)
+lines(fc_dates, dlm_fc, col = "steelblue", lwd = 2.5)
+
+# ARIMA forecast
+polygon(c(fc_dates, rev(fc_dates)),
+        c(arima_fc$lower[,2], rev(arima_fc$upper[,2])),
+        col = rgb(1, 0.5, 0, 0.15), border = NA)
+lines(fc_dates, arima_fc$mean, col = "darkorange", lwd = 2.5)
+
+# HMM forecast
+polygon(c(fc_dates, rev(fc_dates)),
+        c(hmm_fc_lower, rev(hmm_fc_upper)),
+        col = rgb(0, 0.5, 0, 0.15), border = NA)
+lines(fc_dates, hmm_fc, col = "darkgreen", lwd = 2.5)
+
+legend("topleft",
+       legend = c("Observed", "DLM", "ARIMA", "HMM", "95% CI"),
+       col = c("black", "steelblue", "darkorange", "darkgreen", "gray70"),
+       lwd = c(1.5, 2.5, 2.5, 2.5, 10),
+       bty = "n")
+```
+
+## Forecast Comparison Interpretation
+
+The three models produce dramatically different 10-year forecasts, revealing fundamental differences in their underlying assumptions:
+
+**DLM (Random Walk):** Forecasts a flat line at the last observed price ($283.10) with linearly expanding confidence intervals. This reflects the random walk assumption where the best forecast for any future price is the current price, with uncertainty growing proportionally to the forecast horizon. By year 10, the 95% CI ranges from $115 to $451, encompassing a wide range of possibilities.
+
+**ARIMA (Explosive Growth):** Projects aggressive price appreciation to $6,612.70 by year 10, but with enormous uncertainty (95% CI: -$72,376 to $85,601). The negative lower bound is clearly unrealistic (prices can't go negative) and highlights a critical flaw: the model has captured the historical upward trend but extrapolates it indefinitely without economic justification. This is a common pitfall with ARIMA models on strongly trending data.
+
+**HMM (Moderate Growth):** Forecasts steady appreciation to $588.76 over 10 years with much narrower confidence intervals (95% CI: $318 to $859). This reflects the AR(1) structure that allows for mean reversion while still capturing positive drift. The forecast is more conservative than ARIMA but suggests continued growth, staying within economically plausible bounds.
+
+```{r forecast-zoom, fig.width=12, fig.height=7}
+# Forecast only (zoomed in)
+y_min_fc <- min(dlm_fc_lower, arima_fc$lower[,2], hmm_fc_lower, na.rm = TRUE)
+y_max_fc <- max(dlm_fc_upper, arima_fc$upper[,2], hmm_fc_upper, na.rm = TRUE)
+
+plot(fc_dates, dlm_fc, type = "n",
+     ylim = c(y_min_fc, y_max_fc),
+     main = "10-Year Forecast Comparison with 95% Confidence Intervals",
+     xlab = "Date", ylab = "Price ($)")
+
+# DLM
+polygon(c(fc_dates, rev(fc_dates)),
+        c(dlm_fc_lower, rev(dlm_fc_upper)),
+        col = rgb(0, 0, 1, 0.2), border = NA)
+lines(fc_dates, dlm_fc, col = "steelblue", lwd = 2.5)
+
+# ARIMA
+polygon(c(fc_dates, rev(fc_dates)),
+        c(arima_fc$lower[,2], rev(arima_fc$upper[,2])),
+        col = rgb(1, 0.5, 0, 0.2), border = NA)
+lines(fc_dates, arima_fc$mean, col = "darkorange", lwd = 2.5)
+
+# HMM
+polygon(c(fc_dates, rev(fc_dates)),
+        c(hmm_fc_lower, rev(hmm_fc_upper)),
+        col = rgb(0, 0.5, 0, 0.2), border = NA)
+lines(fc_dates, hmm_fc, col = "darkgreen", lwd = 2.5)
+
+abline(h = y[n], lty = 3, col = "gray30", lwd = 1.5)
+
+legend("topleft",
+       legend = c("DLM", "ARIMA", "HMM", "Last Observed", "95% CI"),
+       col = c("steelblue", "darkorange", "darkgreen", "gray30", "gray70"),
+       lwd = c(2.5, 2.5, 2.5, 1.5, 10),
+       lty = c(1, 1, 1, 3, 1),
+       bty = "n")
+```
+
+```{r individual-forecasts, fig.width=10, fig.height=12}
+# Individual model forecast plots
+par(mfrow = c(3, 1))
+
+# DLM only
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(min(y, dlm_fc_lower), max(y, dlm_fc_upper)),
+     main = "DLM: 10-Year Forecast with 95% Credible Interval",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50")
+polygon(c(fc_dates, rev(fc_dates)),
+        c(dlm_fc_lower, rev(dlm_fc_upper)),
+        col = rgb(0, 0, 1, 0.3), border = NA)
+lines(fc_dates, dlm_fc, col = "steelblue", lwd = 2.5)
+legend("topleft", legend = c("Observed", "Forecast", "95% Credible Interval"),
+       col = c("black", "steelblue", rgb(0, 0, 1, 0.3)),
+       lwd = c(1.5, 2.5, 10), bty = "n")
+
+# ARIMA only
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(min(y, arima_fc$lower[,2]), max(y, arima_fc$upper[,2])),
+     main = "ARIMA: 10-Year Forecast with 95% Confidence Interval",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50")
+polygon(c(fc_dates, rev(fc_dates)),
+        c(arima_fc$lower[,2], rev(arima_fc$upper[,2])),
+        col = rgb(1, 0.5, 0, 0.3), border = NA)
+lines(fc_dates, arima_fc$mean, col = "darkorange", lwd = 2.5)
+legend("topleft", legend = c("Observed", "Forecast", "95% Confidence Interval"),
+       col = c("black", "darkorange", rgb(1, 0.5, 0, 0.3)),
+       lwd = c(1.5, 2.5, 10), bty = "n")
+
+# HMM only
+plot(dates, y, type = "l", col = "black", lwd = 1.5, xlim = range(all_dates),
+     ylim = c(min(y, hmm_fc_lower), max(y, hmm_fc_upper)),
+     main = "HMM: 10-Year Forecast with 95% Confidence Interval",
+     xlab = "Date", ylab = "Price ($)")
+abline(v = max(dates), lty = 2, col = "gray50")
+polygon(c(fc_dates, rev(fc_dates)),
+        c(hmm_fc_lower, rev(hmm_fc_upper)),
+        col = rgb(0, 0.5, 0, 0.3), border = NA)
+lines(fc_dates, hmm_fc, col = "darkgreen", lwd = 2.5)
+legend("topleft", legend = c("Observed", "Forecast", "95% Confidence Interval"),
+       col = c("black", "darkgreen", rgb(0, 0.5, 0, 0.3)),
+       lwd = c(1.5, 2.5, 10), bty = "n")
+```
+
+```{r forecast-summary-table}
+# Summary of forecast values
+forecast_summary <- data.frame(
+  Model = c("DLM", "ARIMA", "HMM"),
+  `1-Year` = c(dlm_fc[252], arima_fc$mean[252], hmm_fc[252]),
+  `5-Year` = c(dlm_fc[252*5], arima_fc$mean[252*5], hmm_fc[252*5]),
+  `10-Year` = c(dlm_fc[252*10], arima_fc$mean[252*10], hmm_fc[252*10]),
+  `1Y_Lower` = c(dlm_fc_lower[252], arima_fc$lower[252, 2], hmm_fc_lower[252]),
+  `1Y_Upper` = c(dlm_fc_upper[252], arima_fc$upper[252, 2], hmm_fc_upper[252]),
+  `10Y_Lower` = c(dlm_fc_lower[n_ahead], arima_fc$lower[n_ahead, 2], hmm_fc_lower[n_ahead]),
+  `10Y_Upper` = c(dlm_fc_upper[n_ahead], arima_fc$upper[n_ahead, 2], hmm_fc_upper[n_ahead])
+)
+
+kable(forecast_summary, digits = 2,
+      caption = "Forecast Summary at Key Time Points",
+      col.names = c("Model", "1-Year", "5-Year", "10-Year",
+                    "1Y Lower", "1Y Upper", "10Y Lower", "10Y Upper"))
+```
+
+## Forecast Summary Interpretation
+
+The forecast summary table quantifies the differences observed in the plots:
+
+- **1-Year Forecasts:** All three models agree fairly closely ($283-$314), with the HMM showing modest appreciation. Even at this short horizon, ARIMA shows the widest confidence intervals.
+
+- **5-Year Forecasts:** Divergence becomes apparent. DLM stays flat at $283, ARIMA predicts $3,448, and HMM forecasts $436. The ARIMA prediction is already showing signs of unrealistic extrapolation.
+
+- **10-Year Forecasts:** The models completely diverge. ARIMA's prediction of $6,613 with a confidence interval including negative values is clearly problematic. The HMM's forecast of $589 (roughly double the current price) represents a ~7.6% annualized return, which is more aligned with historical equity market returns.
+
+**Key Takeaway:** For long-term stock price forecasting, the DLM and HMM provide more realistic predictions. The DLM's assumption of no predictable drift represents maximum uncertainty about future prices. The HMM balances historical trends with mean-reversion. The ARIMA model's mechanical extrapolation of past trends produces forecasts that should be viewed with extreme skepticism for investment decisions.
+
+# Conclusions
+
+## Summary of Findings
+
+1. **Model Performance:** The DLM achieved near-perfect in-sample fit with the best information criteria, while HMM and ARIMA showed comparable but inferior performance. However, superior in-sample fit doesn't guarantee better forecasting.
+
+2. **Forecast Behavior:** The three models revealed their underlying assumptions through forecasts:
+   - DLM: Random walk with expanding uncertainty
+   - ARIMA: Unrealistic explosive growth
+   - HMM: Moderate growth with mean reversion
+
+3. **Practical Implications:** For investment decisions, the HMM provides the most balanced forecast, incorporating historical growth trends while avoiding the ARIMA's unrealistic extrapolation. The DLM's flat forecast represents the most conservative position and aligns with efficient market theory.
+
+4. **Model Choice:** The choice of model should depend on the application:
+   - **Short-term trading:** DLM or HMM for accurate price tracking
+   - **Long-term forecasting:** HMM for realistic price paths
+   - **Risk management:** DLM for conservative uncertainty estimates
+   - **Avoid:** ARIMA for long-term price forecasting without economic constraints
+
+## Recommendations
+
+For future analysis, consider:
+- Incorporating regime-switching volatility (GARCH-HMM)
+- Adding economic fundamentals as covariates
+- Implementing rolling window validation for forecast evaluation
+- Exploring ensemble methods combining multiple models
+- Testing forecast performance in out-of-sample periods
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
