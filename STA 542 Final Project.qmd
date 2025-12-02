@@ -769,8 +769,4 @@ For future analysis, consider:
 - Exploring ensemble methods combining multiple models
 - Testing forecast performance in out-of-sample periods
 
-# Session Info
 
-```{r session-info}
-sessionInfo()
-```
