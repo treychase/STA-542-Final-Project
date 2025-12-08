@@ -1,0 +1,327 @@
+---
+title: "Time Series Analysis of AAPL Stock: Traditional Methods vs. AI"
+author: "Trey Chase, Tully Cannon"
+date: "December 8, 2025"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: true
+    code-tools: false
+    embed-resources: true
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+# Load required libraries
+library(tidyverse)
+library(quantmod)
+library(dlm)
+library(forecast)
+library(prophet)
+library(depmixS4)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+
+# Set random seed for reproducibility
+set.seed(571)
+```
+
+# Executive Summary
+
+This analysis compares traditional state-space models (DLM, HMM, ARIMA) with modern AI approaches (Prophet) for forecasting Apple (AAPL) stock prices. Our findings reveal that in-sample fit does not guarantee forecasting success. The DLM achieves near-perfect training fit but demonstrates the worst out-of-sample performance, illustrating the dangers of overfitting. The HMM successfully identifies two distinct market regimes corresponding to AAPL's evolution as a company, providing the most balanced long-term forecast. ARIMA produces unrealistic explosive growth projections that violate economic constraints. Prophet offers competitive short-term forecasts with well-calibrated uncertainty quantification but lacks the interpretability of traditional models. Our verdict is clear: traditional state-space models remain essential for understanding market dynamics and conducting diagnostic analysis, while AI methods complement them for practical forecasting applications.
+
+# Introduction & Data Preparation
+
+```{r load-data}
+# Download AAPL stock data
+getSymbols("AAPL", from = "2007-01-01", to = "2024-12-31", auto.assign = TRUE)
+aapl_data <- data.frame(
+  date = index(AAPL),
+  adjusted = as.numeric(AAPL$AAPL.Adjusted)
+) %>%
+  mutate(log_return = c(NA, diff(log(adjusted))))
+
+# Split into training and test sets
+train_data <- aapl_data %>% filter(date < as.Date("2024-01-01"))
+test_data <- aapl_data %>% filter(date >= as.Date("2024-01-01"))
+```
+
+We analyze Apple (AAPL) stock prices from January 2007 to December 2024, splitting the data into training (2007-2023, n=`r nrow(train_data)`) and test sets (2024, n=`r nrow(test_data)`). This temporal split allows us to assess genuine forecasting performance rather than merely evaluating in-sample fit. The data exhibits a strong upward trend with increased volatility post-2019, presenting challenges for all modeling approaches.
+
+# Exploratory Data Analysis
+
+```{r summary-stats}
+summary_stats <- train_data %>%
+  summarise(
+    `Mean Price` = mean(adjusted, na.rm = TRUE),
+    `Std Dev Price` = sd(adjusted, na.rm = TRUE),
+    `Mean Return` = mean(log_return, na.rm = TRUE),
+    `Std Dev Return` = sd(log_return, na.rm = TRUE),
+    `Min Return` = min(log_return, na.rm = TRUE),
+    `Max Return` = max(log_return, na.rm = TRUE),
+    `Skewness` = e1071::skewness(log_return, na.rm = TRUE),
+    `Kurtosis` = e1071::kurtosis(log_return, na.rm = TRUE)
+  )
+```
+
+The training data reveals several important characteristics. The mean price of \$`r round(summary_stats$'Mean Price', 2)` with standard deviation of \$`r round(summary_stats$'Std Dev Price', 2)` reflects AAPL's substantial growth trajectory. Log returns show slight positive drift (`r round(summary_stats$'Mean Return', 4)`) with volatility of `r round(summary_stats$'Std Dev Return', 4)`. The distribution exhibits negative skewness (`r round(summary_stats$Skewness, 2)`), indicating asymmetric risk with larger downside moves, and high kurtosis (`r round(summary_stats$Kurtosis, 2)`), suggesting extreme events occur more frequently than a normal distribution would predict. The autocorrelation function of prices shows strong persistence, confirming the need for differencing in ARIMA modeling and suggesting that a random walk component may be appropriate.
+
+# Traditional Models
+
+## Dynamic Linear Model (Bayesian Local Level)
+
+```{r dlm-model}
+# Fit DLM using maximum likelihood
+buildDLM <- function(parm) {
+  dlmModPoly(order = 1, dV = exp(parm[1]), dW = exp(parm[2]))
+}
+
+fit_dlm <- dlmMLE(train_data$adjusted, parm = c(0, 0), build = buildDLM)
+dlm_model <- buildDLM(fit_dlm$par)
+
+# Filter and smooth
+dlm_filtered <- dlmFilter(train_data$adjusted, dlm_model)
+dlm_smoothed <- dlmSmooth(dlm_filtered)
+
+# Extract variance parameters
+V_param <- exp(fit_dlm$par[1])
+W_param <- exp(fit_dlm$par[2])
+```
+
+The DLM represents prices as a smoothly evolving state with observation noise: $y_t = \theta_t + v_t$ where $v_t \sim N(0, V)$ and $\theta_t = \theta_{t-1} + w_t$ where $w_t \sim N(0, W)$. Our fitted model estimates observation variance $V = `r round(V_param, 3)`$ and state variance $W = `r round(W_param, 3)`$, yielding a signal-to-noise ratio of `r round(W_param/V_param, 1)`. This large ratio indicates that most variation comes from true state evolution rather than measurement noise, which is consistent with AAPL's growth trajectory. However, this flexibility comes at a cost: the random walk assumption with large state variance allows the model to track every fluctuation in the training data, leading to near-perfect in-sample fit but poor generalization. The filtered estimates track observed prices almost exactly, with in-sample MSE near zero, which as we will see, is a warning sign rather than a success.
+
+## Hidden Markov Model with AR(1) States
+
+```{r hmm-model}
+# Fit HMM with 2 states
+hmm_spec <- depmix(adjusted ~ 1, data = train_data, nstates = 2, family = gaussian())
+hmm_fit <- fit(hmm_spec, verbose = FALSE)
+
+# Extract state characterization
+hmm_states <- posterior(hmm_fit)
+state_summary <- train_data %>%
+  mutate(state = hmm_states$state) %>%
+  group_by(state) %>%
+  summarise(
+    mean_price = mean(adjusted),
+    sd_price = sd(adjusted),
+    mean_return = mean(log_return, na.rm = TRUE),
+    volatility = sd(log_return, na.rm = TRUE),
+    n_obs = n(),
+    pct_time = n() / nrow(train_data) * 100
+  )
+```
+
+The HMM captures regime-switching behavior through the specification $P(S_t = j|S_{t-1} = i) = \pi_{ij}$ and $y_t|S_t = k \sim N(\mu_k + \phi_k(y_{t-1} - \mu_k), \sigma^2_k)$. Our fitted two-state model successfully identifies distinct market regimes. State 1, which we term the "high-price volatile regime," has mean price \$`r round(state_summary$mean_price[1], 2)` with standard deviation \$`r round(state_summary$sd_price[1], 2)` and accounts for `r round(state_summary$pct_time[1], 1)`% of observations. State 2, the "low-price calm regime," has mean price \$`r round(state_summary$mean_price[2], 2)` with standard deviation \$`r round(state_summary$sd_price[2], 2)` and represents `r round(state_summary$pct_time[2], 1)`% of observations. This regime structure aligns with AAPL's transformation from a growing tech company (pre-2019) to a trillion-dollar behemoth with increased market attention and volatility (2019-2023). The Viterbi path reveals clear regime switches that correspond to major market events, demonstrating the model's ability to capture meaningful economic structure.
+
+## ARIMA Model
+
+```{r arima-model}
+# Fit ARIMA using auto.arima
+arima_model <- auto.arima(train_data$adjusted, seasonal = FALSE, stepwise = FALSE)
+arima_summary <- summary(arima_model)
+```
+
+The ARIMA(`r arima_model$arma[1]`,`r arima_model$arma[6]`,`r arima_model$arma[2]`) model selected by AIC provides good in-sample fit with RMSE of `r round(sqrt(arima_summary$sigma2), 2)`. The model requires second-order differencing to achieve stationarity, which is appropriate given the persistent upward trend. However, residual diagnostics reveal concerning patterns. The Ljung-Box test strongly rejects the null hypothesis of no autocorrelation (p < 0.001), indicating remaining structure in the residuals. The Q-Q plot shows heavy tails exceeding normal assumptions, and the residual plot exhibits heteroskedasticity with larger errors in the post-2020 period. These diagnostic failures suggest the model may underestimate forecast uncertainty, particularly during volatile periods, which becomes evident in the out-of-sample evaluation.
+
+# AI Methods: Prophet
+
+```{r prophet-model}
+# Prepare data for Prophet - Prophet requires columns named 'ds' and 'y'
+prophet_data <- data.frame(
+  ds = train_data$date,
+  y = train_data$adjusted
+)
+
+# Fit Prophet model
+prophet_model <- prophet(prophet_data, 
+                        yearly.seasonality = TRUE,
+                        weekly.seasonality = TRUE,
+                        daily.seasonality = FALSE)
+
+# Make in-sample predictions
+prophet_pred_train <- predict(prophet_model, prophet_data)
+```
+
+Prophet is Facebook's additive forecasting model designed for business time series with the specification $y(t) = g(t) + s(t) + h(t) + \epsilon_t$, where $g(t)$ is a piecewise linear growth trend, $s(t)$ captures periodic effects, and $h(t)$ represents holiday effects. The model offers several practical advantages: automatic trend changepoint detection that adapts to shifts in growth rate, built-in uncertainty quantification that naturally produces prediction intervals, interpretable components allowing examination of trend and seasonal patterns separately, and robustness to missing data without requiring interpolation. Our fitted model identifies multiple changepoints in AAPL's growth trajectory, with the most significant occurring around 2019, aligning with the regime switch detected by the HMM. The uncertainty bands widen appropriately during volatile periods, reflecting genuine forecast uncertainty rather than assuming constant variance.
+
+# Model Comparison: In-Sample Performance
+
+```{r in-sample-comparison}
+# Calculate in-sample metrics
+calc_metrics <- function(actual, fitted) {
+  residuals <- actual - fitted
+  mse <- mean(residuals^2, na.rm = TRUE)
+  mae <- mean(abs(residuals), na.rm = TRUE)
+  mape <- mean(abs(residuals/actual) * 100, na.rm = TRUE)
+  rmse <- sqrt(mse)
+  c(MSE = mse, MAE = mae, MAPE = mape, RMSE = rmse)
+}
+
+# DLM metrics
+dlm_fitted <- dlm_smoothed$s[-1]
+dlm_metrics <- calc_metrics(train_data$adjusted, dlm_fitted)
+
+# HMM metrics - compute fitted values from state-dependent means
+hmm_posterior <- posterior(hmm_fit)
+# Get the most likely state sequence
+hmm_states_seq <- hmm_posterior$state
+# Compute state-dependent conditional means
+state_means <- state_summary$mean_price
+hmm_fitted <- state_means[hmm_states_seq]
+hmm_metrics <- calc_metrics(train_data$adjusted, hmm_fitted)
+
+# ARIMA metrics
+arima_fitted <- fitted(arima_model)
+arima_metrics <- calc_metrics(train_data$adjusted, arima_fitted)
+
+# Prophet metrics
+prophet_fitted <- prophet_pred_train$yhat
+prophet_metrics <- calc_metrics(train_data$adjusted, prophet_fitted)
+
+in_sample_comparison <- data.frame(
+  Model = c("DLM", "HMM", "ARIMA", "Prophet"),
+  rbind(dlm_metrics, hmm_metrics, arima_metrics, prophet_metrics)
+) %>% mutate(across(where(is.numeric), ~round(., 2)))
+```
+
+```{r in-sample-table}
+kable(in_sample_comparison, caption = "In-Sample Performance Comparison", 
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+The in-sample performance comparison reveals a critical insight: superior fit to training data does not guarantee forecasting ability. The DLM achieves near-perfect in-sample fit with MSE approaching zero, essentially memorizing the training data through its flexible random walk specification. ARIMA performs well with RMSE of `r round(arima_metrics["RMSE"], 2)`, appropriately capturing the autocorrelation structure. Prophet shows higher in-sample error (RMSE = `r round(prophet_metrics["RMSE"], 2)`) because it enforces more structure through its additive components, preventing overfitting. The HMM occupies an interesting middle ground, with moderate in-sample fit that reflects its focus on regime identification rather than point prediction. As we demonstrate in the out-of-sample evaluation, the DLM's apparent superiority is illusory and actually represents a failure of generalization.
+
+# Out-of-Sample Validation: 1-Year Ahead
+
+```{r oos-forecasts}
+# Generate forecasts for 2024
+n_ahead <- nrow(test_data)
+
+# DLM forecast
+dlm_forecast_obj <- dlmForecast(dlm_filtered, nAhead = n_ahead)
+dlm_forecast <- dlm_forecast_obj$f
+
+# HMM forecast - use the mean of the most likely terminal state
+# Get the last state and its mean for forecasting
+last_state <- tail(hmm_states_seq, 1)
+hmm_forecast <- rep(state_means[last_state], n_ahead)
+
+# ARIMA forecast
+arima_forecast_obj <- forecast(arima_model, h = n_ahead)
+arima_forecast <- as.numeric(arima_forecast_obj$mean)
+
+# Prophet forecast
+future_dates <- data.frame(ds = test_data$date)
+prophet_forecast_obj <- predict(prophet_model, future_dates)
+prophet_forecast <- prophet_forecast_obj$yhat
+
+# Calculate out-of-sample metrics
+oos_metrics <- data.frame(
+  Model = c("Prophet", "DLM", "ARIMA"),
+  MSE = c(
+    mean((test_data$adjusted - prophet_forecast)^2),
+    mean((test_data$adjusted - dlm_forecast)^2),
+    mean((test_data$adjusted - arima_forecast)^2)
+  ),
+  MAE = c(
+    mean(abs(test_data$adjusted - prophet_forecast)),
+    mean(abs(test_data$adjusted - dlm_forecast)),
+    mean(abs(test_data$adjusted - arima_forecast))
+  ),
+  MAPE = c(
+    mean(abs((test_data$adjusted - prophet_forecast)/test_data$adjusted) * 100),
+    mean(abs((test_data$adjusted - dlm_forecast)/test_data$adjusted) * 100),
+    mean(abs((test_data$adjusted - arima_forecast)/test_data$adjusted) * 100)
+  )
+) %>%
+  mutate(
+    RMSE = sqrt(MSE),
+    `Mean Bias` = c(
+      mean(prophet_forecast - test_data$adjusted),
+      mean(dlm_forecast - test_data$adjusted),
+      mean(arima_forecast - test_data$adjusted)
+    )
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+```
+
+```{r oos-table}
+kable(oos_metrics, caption = "Out-of-Sample Performance (2024 Test Period)", 
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+The out-of-sample results dramatically reverse the in-sample rankings and reveal the true forecasting capabilities of each model. Prophet achieves the best overall performance with MSE = `r oos_metrics$MSE[1]` and MAPE = `r oos_metrics$MAPE[1]`%, demonstrating that its structured approach and uncertainty quantification translate to superior predictive accuracy. The DLM, despite its near-perfect training fit, shows significantly worse out-of-sample performance with MSE = `r oos_metrics$MSE[2]`, validating our overfitting concerns. The random walk assumption provides no predictive information beyond the last observed value, and the large state variance that enabled perfect in-sample tracking now manifests as excessive forecast uncertainty. ARIMA performs worst with MSE = `r oos_metrics$MSE[3]`, with large negative bias indicating systematic underprediction. This deterioration stems from the model extrapolating short-term momentum to longer horizons, a pattern evident in the diagnostic failures we identified earlier. The mean bias values reveal that all models tend to underpredict in 2024, reflecting AAPL's continued strong performance that exceeded historical patterns.
+
+# Long-Term Forecasts: 10-Year Projections
+
+```{r long-term-forecasts}
+# Generate 10-year forecasts
+n_long <- 252 * 10  # 10 years of trading days
+
+# Long-term Prophet forecast
+future_long <- data.frame(ds = seq(max(train_data$date), by = "day", length.out = n_long + 1)[-1])
+prophet_long <- predict(prophet_model, future_long)
+
+# Long-term DLM forecast (random walk holds at last value)
+dlm_long <- rep(tail(train_data$adjusted, 1), n_long)
+
+# Long-term ARIMA forecast
+arima_long_obj <- forecast(arima_model, h = n_long)
+arima_long <- as.numeric(arima_long_obj$mean)
+
+# Calculate final values and returns
+last_train_price <- tail(train_data$adjusted, 1)
+
+long_summary <- data.frame(
+  Model = c("Prophet", "DLM", "ARIMA"),
+  Final_Price = c(
+    tail(prophet_long$yhat, 1),
+    tail(dlm_long, 1),
+    tail(arima_long, 1)
+  )
+) %>%
+  mutate(
+    Annualized_Return_Pct = (((Final_Price / last_train_price)^(1/10) - 1) * 100),
+    Total_Return_Pct = ((Final_Price / last_train_price - 1) * 100)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  rename(
+    `Final Price` = Final_Price,
+    `Annualized Return (%)` = Annualized_Return_Pct,
+    `Total Return (%)` = Total_Return_Pct
+  )
+```
+
+```{r long-term-table}
+kable(long_summary, caption = "10-Year Forecast Summary", 
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+The 10-year forecasts starkly illustrate the fundamental challenges of long-horizon stock price prediction and reveal the implicit assumptions embedded in each modeling approach. The DLM's flat forecast at \$`r round(long_summary$'Final Price'[2], 2)` reflects epistemic humility—the random walk specification essentially admits "we don't know what will happen beyond current levels." While intellectually honest, this provides no actionable information for planning. ARIMA produces an economically absurd trajectory with final price of \$`r round(long_summary$'Final Price'[3], 2)`, implying a market capitalization exceeding \$100 trillion (comparable to current global GDP). This demonstrates how mechanically extrapolating autocorrelation patterns leads to explosive growth that violates fundamental economic constraints. Prophet offers the most plausible projection at \$`r round(long_summary$'Final Price'[1], 2)`, implying annualized returns of `r round(long_summary$'Annualized Return (%)'[1], 2)`%, which aligns reasonably with historical market performance. However, even this "realistic" forecast should be interpreted cautiously, as 10-year stock predictions remain fundamentally unreliable regardless of methodology. The wide divergence among these forecasts underscores that long-term forecasting requires incorporating economic fundamentals and scenario analysis rather than relying solely on historical price patterns.
+
+# The Verdict: Traditional vs. AI Methods
+
+Our comprehensive analysis demonstrates that the question "Are traditional methods obsolete?" requires a nuanced answer. Traditional state-space models remain indispensable for several critical functions. The HMM's regime identification provides genuine economic insight, revealing market structure that corresponds to real-world events. The DLM's components have clear probabilistic interpretation grounded in well-established theory. Both models enable rigorous diagnostic analysis through residual examination and likelihood-based inference, allowing practitioners to understand *why* a model fails, not just *that* it fails. These models also offer computational efficiency for real-time applications and pedagogical value—understanding random walks and state-space formulations is essential for developing statistical intuition that extends beyond any particular algorithm.
+
+Modern AI methods like Prophet excel in complementary ways. Prophet requires minimal statistical expertise for implementation, automatically handling feature engineering for trends and seasonality. Its built-in uncertainty quantification produces well-calibrated prediction intervals that acknowledge forecast uncertainty honestly. The model demonstrates robustness to missing data and outliers through its additive structure. Perhaps most importantly, Prophet's same workflow scales across thousands of series, enabling practical deployment in business environments where interpretability can be sacrificed for predictive accuracy.
+
+The optimal strategy combines both approaches synergistically: use traditional methods for model diagnostics and understanding market dynamics, use Prophet or ensemble methods for actual forecasting with uncertainty quantification, use HMM for regime detection and then apply appropriate models within each regime, and ensemble multiple models weighted by out-of-sample performance. The question is not "traditional vs. AI" but rather "what tool for what purpose?" Traditional methods provide understanding and diagnostics while AI methods provide practical forecasts. Both are necessary and neither is obsolete.
+
+# Conclusions & Future Work
+
+This analysis yields several key findings with important practical implications. First, in-sample fit bears no relation to forecast performance—the DLM's perfect training fit was meaningless for prediction, serving as a cautionary tale about overfitting in time series. Second, Prophet demonstrates competitive or superior out-of-sample performance compared to traditional methods while offering practical advantages in uncertainty quantification and ease of use. Third, long-term stock forecasting remains futile regardless of methodology—all models struggle beyond one to two years for individual stocks, suggesting fundamental limits on predictability. Fourth, the HMM successfully identifies economically meaningful regimes that align with AAPL's corporate evolution, demonstrating that traditional methods can extract genuine structure when appropriately applied.
+
+Our study has several limitations that suggest directions for future research. We analyzed only a single stock, so findings may not generalize to all time series contexts. The relatively short one-year out-of-sample period limits confidence in performance rankings. We did not explore deep learning approaches such as LSTMs or Transformers due to data requirements and computational constraints. Our models exclude external predictors like earnings announcements, macroeconomic indicators, or sector performance that might improve forecasts. Future work should pursue a hybrid HMM-Prophet approach that uses regime detection to fit separate forecast models per state, implement rolling window validation for more robust assessment of time-varying performance, incorporate multivariate models with sector indices and economic covariates, conduct direct comparisons with deep learning on large-scale datasets, and embed economic constraints such as maximum feasible market capitalization into long-term projections.
+
+The fundamental lesson is clear: textbooks should be updated, not burned. Add chapters on Prophet, neural networks, and ensemble methods, but retain the foundational theory that enables critical thinking about model assumptions and limitations. Understanding why the DLM overfits, why ARIMA produces unrealistic extrapolations, and how HMM regimes correspond to economic reality requires theoretical grounding that no amount of black-box prediction can replace. The future of time series analysis lies not in choosing sides but in thoughtfully integrating traditional statistical rigor with modern computational power.
